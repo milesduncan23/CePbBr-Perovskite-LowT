@@ -1,0 +1,5 @@
+numpy
+scipy
+pandas
+matplotlib
+openpyxl # Used by numpy to read a .xlsx
