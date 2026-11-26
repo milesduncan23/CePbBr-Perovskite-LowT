@@ -1,7 +1,7 @@
 import numpy as np
 
 import config as cfg
-from fitting import load_sample, fit_peaks
+from fitting import load_sample, noise_level, fit_free, fit_locked
 from plotting import plot_spectrum, plot_amplitudes, plot_centres, plot_combined
 
 # ==========================================
@@ -28,24 +28,37 @@ for i in cfg.SAMPLES:
     # Read and process data
     x_data, spectra = load_sample(cfg.DATA_DIR / (cfg.FILES[i] + ".xlsx"))
 
-    # No previous fit at a sample's first power (powers run low -> high)
+    power_names = list(spectra) # Low -> high, as in the spreadsheet
+    powers_mw = [float(power.split()[0]) for power in power_names]
+
+    fits = [None] * len(power_names)
+    offsets = [None] * len(power_names)
+
+    # Fit from the highest power down: the brightest spectrum gives the most reliable first fit, and its peak
+    # positions (the pattern) are then locked for every lower power, which may only slide them all together
+    pattern = None
     prev = None
 
-    power_names, powers_mw, fits, offsets = [], [], [], []
+    for k in range(len(power_names) - 1, -1, -1):
+        y_data = spectra[power_names[k]]
 
-    for power, y_data in spectra.items():
-
-        # Fit peak parameters using initial guesses, starting from the previous power's fit
-        peaks, offset = fit_peaks(x_data, y_data, cfg.N_PEAKS, cfg.PEAK_OFFSETS, cfg.REF, cfg.REF_POS, prev)
+        if pattern is None:
+            peaks, offset = fit_free(x_data, y_data, cfg.N_PEAKS, cfg.PEAK_OFFSETS, cfg.REF_POS)
+            pattern = peaks
+        else:
+            peaks, offset = fit_locked(x_data, y_data, pattern, prev)
         prev = peaks
 
-        # Collect per-power results
-        power_names.append(power)
-        powers_mw.append(float(power.split()[0]))
-        fits.append(peaks)
-        offsets.append(offset)
+        # Store at index k, so results stay in low -> high power order
+        fits[k] = peaks
+        offsets[k] = offset
 
     fits = np.array(fits) # [power, peak, parameter], parameters: amp, center, sigma, eta
+
+    # Noise level of each spectrum, for the detection limit below
+    noise = []
+    for k in range(0, len(power_names)):
+        noise.append(noise_level(spectra[power_names[k]]))
 
     results[i] = {
         "energy": x_data,
@@ -54,9 +67,19 @@ for i in cfg.SAMPLES:
         "powers": powers_mw,               # mW
         "peaks": fits,
         "offsets": offsets,
-        "amps": fits[:, :, 0].copy(),      # Copy, so leaving out garbage points never touches the fits
+        "noise": noise,                    # One noise level per power, same units as the spectra
+        "amps": fits[:, :, 0].copy(),      # Copy, so leaving out undetected / garbage points never touches the fits
         "fwhm": 2.355 * fits[:, :, 2],     # Math might differ, this is the equation for Gaussians
     }
+
+# Leave out amplitudes below the detection limit (amplitude plots only): a peak smaller than DETECTION_SNR
+# noise units is not really measured, and its near-zero amplitude would spike down on the log axes
+for i in results:
+    for k in range(0, len(results[i]["powers"])):
+        limit = cfg.DETECTION_SNR * results[i]["noise"][k]
+        for j in range(0, cfg.N_PEAKS):
+            if results[i]["amps"][k, j] < limit:
+                results[i]["amps"][k, j] = np.nan
 
 # Leave out points flagged as garbage in config (amplitude plots only)
 for (i, p, j) in cfg.GARBAGE_PEAKS:

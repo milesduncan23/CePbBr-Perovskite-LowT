@@ -25,6 +25,12 @@ def load_sample(file_path):
 
     return x_data, spectra
 
+def noise_level(y):
+    # Noise level: robust (MAD) spread of point-to-point differences, which peaks barely affect;
+    # the sqrt(2) is because a difference of two noisy points has twice the variance
+    d = np.diff(y)
+    return 1.4826 * np.median(np.abs(d - np.median(d))) / np.sqrt(2)
+
 # ==========================================
 # Peak Fitting
 # ==========================================
@@ -37,9 +43,9 @@ def pseudo_voigt(x, amp, center, sigma, eta):
     # Scale output between Gaussian and Lorentzian using factor eta
     return amp * (eta * l + (1 - eta) * g)
 
-def auto_guesses(x, y, n, offsets, ref, ref_pos, prev):
-    # Takes in initial guesses and finds exact placement for n peaks with raw data
-    # prev: peaks from the previous power's fit (n x 4), or None at a sample's first power
+def auto_guesses(x, y, n, offsets, ref_pos):
+    # Places the peak template on the raw data and returns starting values and bounds for n free peaks
+    # Only used for a sample's first (highest power) fit, every lower power keeps these positions (see fit_locked)
 
     # ==========================================
     # Settings
@@ -49,10 +55,8 @@ def auto_guesses(x, y, n, offsets, ref, ref_pos, prev):
 
     min_snr = 3          # A feature must stand this many noise units above the baseline to count as a peak
     min_sep = 0.004      # Minimum peak separation (eV)
-    ref_win = 0.010      # Reference position search window (eV)
-    ref_snap = 0.003     # Maximum distance for reference position to be placed from guess (eV)
-    faded = 0.02         # Previous-fit peaks below this fraction of the tallest go back to the template
-    template_tol = 0.006 # How far a detected center may stray from guess (eV)
+    search = 0.006       # How far the whole template may slide to line up with the data (eV), under half the ~10 meV A-peak spacing
+    template_tol = 0.006 # How far a peak may stray from its template position (eV)
 
     max_shift = 0.004 # How far a center may move from its starting position (eV)
     min_gap = 0.004   # Neighbouring centers never get closer than this (eV)
@@ -91,10 +95,7 @@ def auto_guesses(x, y, n, offsets, ref, ref_pos, prev):
         # Return roots within data range
         return r[(r > x.min()) & (r < x.max())]
 
-    # Noise level: robust (MAD) spread of point-to-point differences, which peaks barely affect;
-    # the sqrt(2) is because a difference of two noisy points has twice the variance
-    d = np.diff(y)
-    noise = 1.4826 * np.median(np.abs(d - np.median(d))) / np.sqrt(2)
+    noise = noise_level(y)
 
     # Threshold to define a minimum peak height: min_snr noise units above the baseline
     baseline = np.median(y[:20])
@@ -112,30 +113,30 @@ def auto_guesses(x, y, n, offsets, ref, ref_pos, prev):
     features = np.array(sorted(maxima + shoulders))
 
     # ==========================================
-    # Matching Found Features & Guesses
+    # Placing the Template
     # ==========================================
 
-    # At low power, take the largest feature of aggressively smoothed data (It will be our reference for low powers)
-    x_peak = x[np.argmax(savgol_filter(y, 40, 3))]
+    # Slide the whole template in 0.2 meV steps and keep the shift where its peaks sit closest to the detected
+    # features; each peak's distance is capped at match_tol so one missing feature cannot dominate.
+    # Shifts are tried smallest first, so a tie keeps the template where it is
+    shifts = np.arange(-search, search + 1e-9, 0.0002)
+    shifts = shifts[np.argsort(np.abs(shifts))]
 
-    # Define template centers wrt. reference peak
-    if abs(x_peak - ref_pos) <= ref_win:                                       # Peak within window
-        close = [c for c in maxima if abs(c - x_peak) <= ref_snap]             # Compile candidates
-        x_ref = min(close, key=lambda c: abs(c - x_peak)) if close else x_peak # Returns the closest candidate
-        template = x_ref + offsets
-        centres = template.copy()
-    elif prev is not None:                                                           # This will be the case after the reference peak is no longer the largest
-        prev_c = prev[:, 1]                                                          # Previous fit's centers
-        prev_a = prev[:, 0]                                                          # Previous fit's amplitudes
-        template = prev_c[ref] + offsets                                             # Return template with previous reference
-        centres = np.where(prev_a >= faded * prev_a.max(), prev_c, template)         # Return to template values for peaks that faded below %tol of the tallest previous peak
-        centres = np.clip(centres, template - template_tol, template + template_tol) # Clip values which are outside allowed tol from guess
-        centres = np.maximum.accumulate(centres + np.arange(n) * 1e-6)               # Keep order
-    else:                                                          # Fallback condition
-        pool = [c for c in maxima if abs(c - ref_pos) <= ref_win]  # Compile candidates
-        x_ref = max(pool, key=lambda c: P(c)) if pool else ref_pos # Pick out max, or reference
-        template = x_ref + offsets
-        centres = template.copy()
+    best_shift = 0.0
+    best_cost = np.inf
+    for shift in shifts:
+        cost = 0.0
+        for t in ref_pos + offsets + shift:
+            if len(features) > 0:
+                cost += min(np.min(np.abs(features - t)), match_tol)
+            else:
+                cost += match_tol
+        if cost < best_cost:
+            best_cost = cost
+            best_shift = shift
+
+    template = ref_pos + offsets + best_shift
+    centres = template.copy()
 
     # Define window positions,
     half_gaps = np.maximum(np.diff(centres) / 2 - min_gap / 2, 0.0005)                # Half gaps between each center, taking into account the min peak separation
@@ -174,24 +175,15 @@ def auto_guesses(x, y, n, offsets, ref, ref_pos, prev):
     off = (float(np.clip(baseline, off_lo + 1e-12, off_hi - 1e-12)), off_lo, off_hi)
     return p0, lo, hi, off
 
-def fit_peaks(x, y, n, offsets, ref, ref_pos, prev):
-    # Fits four free parameters for each distribution (amp, center, sigma, eta)
-    # prev: peaks from the previous power's fit (n x 4), or None at a sample's first power
-
-    tail_ratio = 0.5 # Tail peak at most this fraction of the reference peak
+def fit_free(x, y, n, offsets, ref_pos):
+    # First fit of a sample (highest power): four free parameters for each peak (amp, center, sigma, eta)
 
     # p0, lo, hi: n x 4 (amp, center, sigma, eta per peak); off: (start, lower, upper)
-    p0, lo, hi, (off0, off_lo, off_hi) = auto_guesses(x, y, n, offsets, ref, ref_pos, prev)
-
-    # The tail peak (last row) is fitted as a ratio r = tail amplitude / ref amplitude,
-    # with 0 <= r <= tail_ratio, so it can never outgrow the reference line
-    p0[-1, 0] = min(p0[-1, 0] / max(p0[ref, 0], 1e-12), 0.5 * tail_ratio)
-    lo[-1, 0], hi[-1, 0] = 0.0, tail_ratio
+    p0, lo, hi, (off0, off_lo, off_hi) = auto_guesses(x, y, n, offsets, ref_pos)
 
     def model(x, *q):
         # curve_fit works on a flat list: q = (4 values per peak, row by row, then the offset)
         pk = np.array(q[:-1]).reshape(n, 4)
-        pk[-1, 0] *= pk[ref, 0]                     # Tail: ratio -> amplitude
         y_fit = np.full_like(x, q[-1], dtype=float) # Offset
         for row in pk:
             y_fit += pseudo_voigt(x, *row)          # amp, center, sigma, eta
@@ -203,7 +195,81 @@ def fit_peaks(x, y, n, offsets, ref, ref_pos, prev):
                      maxfev=50000)
 
     peaks = np.array(q[:-1], dtype=float).reshape(n, 4)
-    peaks[-1, 0] *= peaks[ref, 0] # Tail: ratio -> ordinary amplitude
     offset = float(q[-1])
+
+    return peaks, offset
+
+def fit_locked(x, y, pattern, prev):
+    # Fit at a lower power: every peak keeps its position from the sample's first fit (pattern) and the whole set
+    # may only slide together by one common shift. Amplitudes, widths and eta stay free.
+    # pattern: the first (highest power) fit, n x 4; prev: the previous (next higher) power's fit, n x 4
+
+    # ==========================================
+    # Settings
+    # ==========================================
+
+    max_shift    = 0.005            # Largest common shift away from the first fit's positions (eV). The data never needed
+                                    # more than 4.8 meV, and 5 meV is half the ~10 meV peak spacing, so no peak can take its neighbour's place
+    amp_start    = 0.7              # Start amplitudes below the curve height, since neighbours overlap
+    sigma_bounds = (0.002, 0.009)   # Fit limits on sigma (eV), same as the first fit
+    eta_bounds   = (0.0, 1.0)       # Fit limits on eta, same as the first fit
+
+    n = pattern.shape[0]
+    centres = pattern[:, 1]
+
+    # ==========================================
+    # Starting Values & Bounds
+    # ==========================================
+
+    # Start from the previous power's common shift
+    shift0 = float(np.clip(prev[0, 1] - centres[0], -max_shift + 1e-12, max_shift - 1e-12))
+
+    # Smoothed curve, baseline and height, as in auto_guesses
+    y_s = savgol_filter(y, 5, 2)
+    baseline = np.median(y[:20])
+    top = y_s.max() - baseline
+
+    p0, lo, hi = np.zeros((n, 3)), np.zeros((n, 3)), np.zeros((n, 3))
+    for j in range(n):
+        # Amplitude from the curve height at the shifted center, width and eta from the previous power
+        height = max(np.interp(centres[j] + shift0, x, y_s) - baseline, 0.01 * top)
+
+        p0[j] = [amp_start * height, prev[j, 2], prev[j, 3]]
+        lo[j] = [0.0,           sigma_bounds[0], eta_bounds[0]]
+        hi[j] = [1.5 * y.max(), sigma_bounds[1], eta_bounds[1]]
+    off_lo, off_hi = -0.05 * y.max(), 0.10 * y.max()
+
+    # Keep every guess strictly inside its bounds (curve_fit rejects it otherwise)
+    p0 = np.clip(p0, lo + 1e-12, hi - 1e-12)
+    off0 = float(np.clip(baseline, off_lo + 1e-12, off_hi - 1e-12))
+
+    # ==========================================
+    # Fit
+    # ==========================================
+
+    def model(x, *q):
+        # curve_fit works on a flat list: q = (amp, sigma, eta per peak, row by row, then the shift, then the offset)
+        pk = np.array(q[:-2]).reshape(n, 3)
+        shift = q[-2]
+        y_fit = np.full_like(x, q[-1], dtype=float) # Offset
+        for j in range(n):
+            y_fit += pseudo_voigt(x, pk[j, 0], centres[j] + shift, pk[j, 1], pk[j, 2])
+        return y_fit
+
+    # x_scale='jac' lets the optimizer handle amplitudes (~1e5) and widths/shift (~1e-3) on equal footing;
+    # without it about 1 fit in 10 stopped early in a bad spot
+    q, _ = curve_fit(model, x, y,
+                     p0=np.r_[p0.ravel(), shift0, off0],
+                     bounds=(np.r_[lo.ravel(), -max_shift, off_lo], np.r_[hi.ravel(), max_shift, off_hi]),
+                     maxfev=50000, x_scale='jac')
+
+    pk = np.array(q[:-2], dtype=float).reshape(n, 3)
+    shift = float(q[-2])
+    offset = float(q[-1])
+
+    # Back to the usual n x 4 layout (amp, center, sigma, eta)
+    peaks = np.zeros((n, 4))
+    for j in range(n):
+        peaks[j] = [pk[j, 0], centres[j] + shift, pk[j, 1], pk[j, 2]]
 
     return peaks, offset
