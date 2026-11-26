@@ -5,8 +5,7 @@ from scipy.optimize import curve_fit
 from scipy.signal import savgol_filter
 from numpy.polynomial import Chebyshev
 
-from pathlib import Path
-BASE_DIR = Path(__file__).resolve().parent
+import config as cfg
 
 # ==========================================
 # TO-DO
@@ -221,29 +220,15 @@ def ref_lines(ax):
 # Analysis
 # ==========================================
 
-FILES = ["ES073(undoped) @55K Fluence dependece",
-         "ES074(10_ doped) @55K Fluence dependece",
-         "ES075(20_ doped) @55K Fluence dependece",
-         "ES076(30_ doped) @55K Fluence dependece",
-         "ES077(40_ doped) @55K Fluence dependece"]
-
-DOPE_LABELS = ["Undoped", "10% Doped", "20% Doped", "30% Doped", "40% Doped"]
-
-# Guesses ----------------------------------------------------- ref
-PEAK_OFFSETS = (-66.2, -55.7, -46.0, -39.1, -29.4, -19.4, -8.6, 0.0, 11.1) # meV
-REF = 7 # Reference Peak Index (offset 0)
-REF_POS = 2.3070
-N_PEAKS = len(PEAK_OFFSETS)
-
 results = {}
 
-for i in range(0, 5): # , 4
-    
+for i in cfg.SAMPLES:
+
     # ==========================================
     # Read and process data
     # ==========================================
-    
-    file_path = BASE_DIR / "CSV_Data" / (FILES[i] + ".xlsx")
+
+    file_path = cfg.DATA_DIR / (cfg.FILES[i] + ".xlsx")
     df = pd.read_excel(file_path, sheet_name='Sheet1')
 
     df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
@@ -255,12 +240,12 @@ for i in range(0, 5): # , 4
     fit_peaks.previous = None
     
     # Create per-sample peak vs power plots
-    pow_lin = plt.figure(figsize=(12, 7))
-    pow_log = plt.figure(figsize=(12, 7))
+    pow_lin = plt.figure(figsize=cfg.FIG_SIZE)
+    pow_log = plt.figure(figsize=cfg.FIG_SIZE)
     ax_lin = pow_lin.add_subplot()
     ax_log = pow_log.add_subplot()
-    
-    pos = plt.figure(figsize=(12, 7))
+
+    pos = plt.figure(figsize=cfg.FIG_SIZE)
     ax_pos = pos.add_subplot()
     
     powers_mw, amps, cens = [], [], []
@@ -275,7 +260,7 @@ for i in range(0, 5): # , 4
         # ==========================================
         
         # Fit peak parameters using initial guesses
-        peaks, offset = fit_peaks(x_data, y_data, N_PEAKS, PEAK_OFFSETS, REF, REF_POS)
+        peaks, offset = fit_peaks(x_data, y_data, cfg.N_PEAKS, cfg.PEAK_OFFSETS, cfg.REF, cfg.REF_POS)
         
         # Deconvoluted peaks from fit parameters
         comps = np.array([pseudo_voigt(x_data, *peak) for peak in peaks])
@@ -291,7 +276,7 @@ for i in range(0, 5): # , 4
         # Per-Power Spectra Plotting
         # ==========================================
         
-        plt.figure(figsize=(12, 7))
+        plt.figure(figsize=cfg.FIG_SIZE)
 
         # Plot raw data and total fit
         plt.plot(x_data, y_data, 'k.', alpha=0.3, label='Data')
@@ -305,20 +290,20 @@ for i in range(0, 5): # , 4
             plt.fill_between(x_data, fit_p[j], alpha=0.2, color=colors[j])
         
         # Formatting
-        title = f"Low-T (55K) {DOPE_LABELS[i]} Spectral Deconvolution ({power})"
+        title = f"Low-T (55K) {cfg.DOPE_LABELS[i]} Spectral Deconvolution ({power})"
 
         plt.xlabel('Energy (eV)', fontsize=14, fontweight='bold')
         plt.ylabel('PL Intensity (a.u.)', fontsize=14, fontweight='bold')
         plt.title(title, fontsize=16)
         plt.legend(fontsize=12, loc='upper right')
-        plt.xlim(2.23, 2.35) # Zoom in on the active region
+        plt.xlim(*cfg.ENERGY_RANGE) # Zoom in on the active region
         plt.grid(True, linestyle='--', alpha=0.4)
         plt.tight_layout()
-        
+
         # Plot Saving
-        folder = BASE_DIR / "Output" / DOPE_LABELS[i].replace(" ", "_")
+        folder = cfg.OUTPUT_DIR / cfg.DOPE_LABELS[i].replace(" ", "_")
         folder.mkdir(parents=True, exist_ok=True)
-        plt.savefig(folder / (f"{power}".replace(" ", "_") + ".png"), dpi=300, bbox_inches="tight")
+        plt.savefig(folder / (f"{power}".replace(" ", "_") + ".png"), dpi=cfg.DPI, bbox_inches="tight")
         plt.close()
         
         # Collect per-power data for plotting
@@ -332,17 +317,22 @@ for i in range(0, 5): # , 4
     # ==========================================
     
     amps = np.array(amps)
-    if i == 0: amps[0, 1] = np.nan # garbage peak
+
+    # Leave out points flagged as garbage in config
+    for (k, p, j) in cfg.GARBAGE_PEAKS:
+        if k == i:
+            amps[p, j] = np.nan
+
     results[i] = (powers_mw, amps)
     for ax in (ax_lin, ax_log):
-        for j in range(N_PEAKS):
+        for j in range(cfg.N_PEAKS):
             ax.plot(powers_mw, amps[:, j], 'o-', color=colors[j], label=f'Peak {j+1}')
     ref_lines(ax_log)
 
     # Formatting
     for ax in (ax_lin, ax_log):
         ax.set_ylabel('Peak amplitude (log a.u.)')
-        ax.set_title(f"{DOPE_LABELS[i]} Peak Amplitude vs Power")
+        ax.set_title(f"{cfg.DOPE_LABELS[i]} Peak Amplitude vs Power")
         ax.legend(ncol=3, fontsize=10)
         ax.grid(True, linestyle='--', alpha=0.4)
     ax_log.set_xscale('log')
@@ -353,10 +343,10 @@ for i in range(0, 5): # , 4
     ax_lin.set_xlabel('Power (mW)')
 
     # Plot Saving (into the sample's own folder; _linear / _log keep the two file names apart)
-    folder = BASE_DIR / "Output" / DOPE_LABELS[i].replace(" ", "_")
+    folder = cfg.OUTPUT_DIR / cfg.DOPE_LABELS[i].replace(" ", "_")
     folder.mkdir(parents=True, exist_ok=True)
     for fig, tag in ((pow_lin, "linear"), (pow_log, "log")):
-        fig.savefig(folder / f"peaks_{tag}.png", dpi=300, bbox_inches="tight")
+        fig.savefig(folder / f"peaks_{tag}.png", dpi=cfg.DPI, bbox_inches="tight")
         plt.close(fig)
 
     # ==========================================
@@ -364,31 +354,29 @@ for i in range(0, 5): # , 4
     # ==========================================
     
     cens = np.array(cens)   # rows: powers, columns: peaks
-    for j in range(N_PEAKS):
+    for j in range(cfg.N_PEAKS):
         ax_pos.plot(powers_mw, cens[:, j], 'o-', color=colors[j], label=f'Peak {j+1}')
 
     ax_pos.set_xlabel('Power (mW)')
     ax_pos.set_ylabel('Peak centre (eV)')
-    ax_pos.set_title(f"{DOPE_LABELS[i]} Peak Centre vs Power")
+    ax_pos.set_title(f"{cfg.DOPE_LABELS[i]} Peak Centre vs Power")
     ax_pos.legend(ncol=3, fontsize=10)
     ax_pos.grid(True, linestyle='--', alpha=0.4)
 
-    pos.savefig(folder / "peaks_position.png", dpi=300, bbox_inches="tight")
+    pos.savefig(folder / "peaks_position.png", dpi=cfg.DPI, bbox_inches="tight")
     plt.close(pos)
 
 # ==========================================
 # Subplot like fig 7
 # ==========================================
     
-cols = plt.cm.tab10(np.arange(N_PEAKS) % 10)
+cols = plt.cm.tab10(np.arange(cfg.N_PEAKS) % 10)
 fig, axs = plt.subplots(2, 2, figsize=(14, 9))
 
-for r, (k, lab) in enumerate(((0, '0% Li'), (4, '40% Li'))):
+for r, (k, lab) in enumerate(((0, cfg.LI_LABELS[0]), (4, cfg.LI_LABELS[4]))):
     P, A = results[k]
-    A = A.copy()
-    if k == 0: A[0, 1] = np.nan # garbage peak
     for c, ax in enumerate(axs[r]):
-        for j in range(N_PEAKS):
+        for j in range(cfg.N_PEAKS):
             ax.plot(P, A[:, j], 'o-', ms=4, color=cols[j], label=f'Peak {j+1}')
         ax.set_yscale('log')
         if c: ax.set_xscale('log'); ref_lines(ax)
@@ -399,8 +387,8 @@ for ax in axs[1]: ax.set_xlabel('Power (mW)')
 for ax in axs[:, 0]: ax.set_ylabel('Peak amplitude (a.u.)')
 axs[0, 0].legend(ncol=3, fontsize=9, loc='center right')
 
-(BASE_DIR / 'Output' / 'Combined').mkdir(parents=True, exist_ok=True)
-fig.savefig(BASE_DIR / 'Output' / 'Combined' / 'undoped_40%_peaks.png', dpi=300, bbox_inches='tight')
+(cfg.OUTPUT_DIR / 'Combined').mkdir(parents=True, exist_ok=True)
+fig.savefig(cfg.OUTPUT_DIR / 'Combined' / 'undoped_40%_peaks.png', dpi=cfg.DPI, bbox_inches='tight')
 plt.close(fig)
 
 # ==========================================
@@ -409,10 +397,10 @@ plt.close(fig)
 
 fig, axs = plt.subplots(3, 2, figsize=(14, 13.5))
 
-for r, (k, lab) in enumerate(((1, '10% Li'), (2, '20% Li'), (3, '30% Li'))):
+for r, (k, lab) in enumerate(((1, cfg.LI_LABELS[1]), (2, cfg.LI_LABELS[2]), (3, cfg.LI_LABELS[3]))):
     P, A = results[k]
     for c, ax in enumerate(axs[r]):
-        for j in range(N_PEAKS):
+        for j in range(cfg.N_PEAKS):
             ax.plot(P, A[:, j], 'o-', ms=4, color=cols[j], label=f'Peak {j+1}')
         ax.set_yscale('log')
         if c: ax.set_xscale('log'); ref_lines(ax)
@@ -423,5 +411,5 @@ for ax in axs[2]: ax.set_xlabel('Power (mW)')
 for ax in axs[:, 0]: ax.set_ylabel('Peak amplitude (a.u.)')
 axs[0, 0].legend(ncol=3, fontsize=9, loc='center right')
 
-fig.savefig(BASE_DIR / 'Output' / 'Combined' / '10_20_30%_peaks.png', dpi=300, bbox_inches='tight')
+fig.savefig(cfg.OUTPUT_DIR / 'Combined' / '10_20_30%_peaks.png', dpi=cfg.DPI, bbox_inches='tight')
 plt.close(fig)
